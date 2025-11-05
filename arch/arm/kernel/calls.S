@@ -408,7 +408,8 @@
 		CALL(sys_pkey_free)
 /* 397 */	CALL(sys_set_rsv)
 /* 398 */	CALL(sys_cancel_rsv) 
-		
+/* 399 */	CALL(sys_wait_until_next_period)
+
 #ifndef syscalls_counted
 .equ syscalls_padding, ((NR_syscalls + 3) & ~3) - NR_syscalls
 #define syscalls_counted

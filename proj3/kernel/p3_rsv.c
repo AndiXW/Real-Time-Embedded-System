@@ -1,3 +1,4 @@
+// proj3/kernel/p3_rsv.c — 4.2 + 4.4 minimal implementation
 #include <linux/kernel.h>
 #include <linux/syscalls.h>
 #include <linux/sched.h>
@@ -9,6 +10,9 @@
 #include <linux/list.h>
 #include <linux/time.h>
 #include <linux/ktime.h>
+#include <linux/hrtimer.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
 
 #define P3_MAX_RSV 50
 
@@ -16,50 +20,27 @@ struct p3_rsv_entry {
 	struct list_head node;
 	pid_t pid;
 	struct task_struct *task; /* ref held */
+
+	/* (C,T) in nanoseconds */
 	ktime_t C_ns;
 	ktime_t T_ns;
-	int prio; /* SCHED_FIFO prio we assigned */
+
+	/* RM-assigned priority */
+	int prio;
+
+	/* 4.4: periodic wake-up machinery */
+	struct hrtimer timer;
+	ktime_t next_release;
+	wait_queue_head_t wq;
+	atomic64_t period_seq;  /* increments each period to wake sleepers */
+	bool canceled;
 };
 
 static LIST_HEAD(p3_rsv_list);
 static DEFINE_SPINLOCK(p3_rsv_lock);
 
-/* Helper: assign SCHED_FIFO priorities by Rate-Monotonic (shorter T -> higher prio) */
-static void p3_reassign_rm_prios_locked(void)
-{
-	struct p3_rsv_entry *it;
-	/* Collect pointers in a temporary array to sort by T */
-	struct p3_rsv_entry *arr[P3_MAX_RSV];
-	int n = 0, i;
+/* ----- helpers ----- */
 
-	list_for_each_entry(it, &p3_rsv_list, node) {
-		if (n < P3_MAX_RSV)
-			arr[n++] = it;
-	}
-	/* Simple O(n^2) sort (n <= 50) by ascending T */
-	for (i = 0; i < n; i++) {
-		int j;
-		for (j = i + 1; j < n; j++) {
-			if (ktime_to_ns(arr[j]->T_ns) < ktime_to_ns(arr[i]->T_ns)) {
-				struct p3_rsv_entry *tmp = arr[i];
-				arr[i] = arr[j]; arr[j] = tmp;
-			}
-		}
-	}
-	/* Highest RT prio is MAX_RT_PRIO-1 (typically 99), lowest is 1 */
-	for (i = 0; i < n; i++) {
-		int prio = (MAX_RT_PRIO - 1) - i;
-		struct sched_param sp = { .sched_priority = prio };
-		if (prio < 1) prio = 1; /* clamp just in case */
-		arr[i]->prio = prio;
-		/* Change scheduling class of the task */
-		if (arr[i]->task) {
-			sched_setscheduler_nocheck(arr[i]->task, SCHED_FIFO, &sp);
-		}
-	}
-}
-
-/* Find reservation entry by pid (caller holds p3_rsv_lock) */
 static struct p3_rsv_entry *p3_find_locked(pid_t pid)
 {
 	struct p3_rsv_entry *it;
@@ -70,28 +51,69 @@ static struct p3_rsv_entry *p3_find_locked(pid_t pid)
 	return NULL;
 }
 
+/* Rate-Monotonic: shorter T -> higher prio */
+static void p3_reassign_rm_prios_locked(void)
+{
+	struct p3_rsv_entry *it, *arr[P3_MAX_RSV];
+	int n = 0, i, j;
+
+	list_for_each_entry(it, &p3_rsv_list, node) {
+		if (n < P3_MAX_RSV) arr[n++] = it;
+	}
+	for (i = 0; i < n; i++)
+		for (j = i + 1; j < n; j++)
+			if (ktime_to_ns(arr[j]->T_ns) < ktime_to_ns(arr[i]->T_ns)) {
+				struct p3_rsv_entry *tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
+			}
+
+	for (i = 0; i < n; i++) {
+		int prio = (MAX_RT_PRIO - 1) - i; if (prio < 1) prio = 1;
+		arr[i]->prio = prio;
+		if (arr[i]->task) {
+			struct sched_param sp = { .sched_priority = prio };
+			sched_setscheduler_nocheck(arr[i]->task, SCHED_FIFO, &sp);
+		}
+	}
+}
+
+/* hrtimer callback: mark new period, wake waiters, re-arm */
+static enum hrtimer_restart p3_timer_cb(struct hrtimer *t)
+{
+	struct p3_rsv_entry *e = container_of(t, struct p3_rsv_entry, timer);
+
+	if (READ_ONCE(e->canceled))
+		return HRTIMER_NORESTART;
+
+	atomic64_inc(&e->period_seq);
+
+	/* advance by one period and re-arm; forward_now avoids drift */
+	hrtimer_forward_now(&e->timer, e->T_ns);
+	wake_up_all(&e->wq);
+	return HRTIMER_RESTART;
+}
+
+/* ----- syscalls ----- */
+
 SYSCALL_DEFINE3(set_rsv, pid_t, pid,
 		struct timespec __user *, C,
 		struct timespec __user *, T)
 {
 	struct timespec c_us, t_us;
-	struct p3_rsv_entry *e;
+	struct p3_rsv_entry *e, *tmp;
 	struct task_struct *p;
 	unsigned long flags;
 	ktime_t Cns, Tns;
+	int count = 0;
 
-	/* If pid==0, apply to current */
-	if (pid == 0)
-		pid = current->pid;
+	if (pid == 0) pid = current->pid;
 
-	/* Copy C/T from userspace */
 	if (copy_from_user(&c_us, C, sizeof(c_us)) ||
 	    copy_from_user(&t_us, T, sizeof(t_us)))
 		return -EFAULT;
 
-	/* Basic validation: strictly positive, and C <= T */
 	if (c_us.tv_sec < 0 || c_us.tv_nsec < 0 || t_us.tv_sec < 0 || t_us.tv_nsec < 0)
 		return -EINVAL;
+
 	Cns = ktime_set(c_us.tv_sec, c_us.tv_nsec);
 	Tns = ktime_set(t_us.tv_sec, t_us.tv_nsec);
 	if (ktime_to_ns(Cns) <= 0 || ktime_to_ns(Tns) <= 0)
@@ -99,49 +121,50 @@ SYSCALL_DEFINE3(set_rsv, pid_t, pid,
 	if (ktime_to_ns(Cns) > ktime_to_ns(Tns))
 		return -EINVAL;
 
-	/* Resolve task */
 	rcu_read_lock();
 	p = pid_task(find_vpid(pid), PIDTYPE_PID);
-	if (p)
-		get_task_struct(p); /* hold a ref; released on cancel */
+	if (p) get_task_struct(p);
 	rcu_read_unlock();
-	if (!p)
-		return -ESRCH;
+	if (!p) return -ESRCH;
 
+	e = NULL;
 	spin_lock_irqsave(&p3_rsv_lock, flags);
 
-	/* Reject if already has a reservation */
 	if (p3_find_locked(pid)) {
 		spin_unlock_irqrestore(&p3_rsv_lock, flags);
 		put_task_struct(p);
 		return -EBUSY;
 	}
 
-	/* Limit total reservations */
-	{
-		int count = 0;
-		list_for_each_entry(e, &p3_rsv_list, node) count++;
-		if (count >= P3_MAX_RSV) {
-			spin_unlock_irqrestore(&p3_rsv_lock, flags);
-			put_task_struct(p);
-			return -ENOSPC;
-		}
+	list_for_each_entry(tmp, &p3_rsv_list, node) count++;
+	if (count >= P3_MAX_RSV) {
+		spin_unlock_irqrestore(&p3_rsv_lock, flags);
+		put_task_struct(p);
+		return -ENOSPC;
 	}
 
-	/* Allocate and insert */
 	e = kzalloc(sizeof(*e), GFP_KERNEL);
 	if (!e) {
 		spin_unlock_irqrestore(&p3_rsv_lock, flags);
 		put_task_struct(p);
 		return -ENOMEM;
 	}
+
 	e->pid  = pid;
 	e->task = p;
 	e->C_ns = Cns;
 	e->T_ns = Tns;
-	list_add_tail(&e->node, &p3_rsv_list);
+	atomic64_set(&e->period_seq, 0);
+	e->canceled = false;
 
-	/* Assign SCHED_FIFO priority by RM across all reservations */
+	/* 4.4: init periodic wake machinery */
+	init_waitqueue_head(&e->wq);
+	hrtimer_init(&e->timer, CLOCK_MONOTONIC, HRTIMER_MODE_PINNED);
+	e->timer.function = p3_timer_cb;
+	/* first release is one period from now */
+	hrtimer_start(&e->timer, e->T_ns, HRTIMER_MODE_REL_PINNED);
+
+	list_add_tail(&e->node, &p3_rsv_list);
 	p3_reassign_rm_prios_locked();
 
 	spin_unlock_irqrestore(&p3_rsv_lock, flags);
@@ -153,9 +176,7 @@ SYSCALL_DEFINE1(cancel_rsv, pid_t, pid)
 	struct p3_rsv_entry *e;
 	unsigned long flags;
 
-	/* If pid==0, apply to current */
-	if (pid == 0)
-		pid = current->pid;
+	if (pid == 0) pid = current->pid;
 
 	spin_lock_irqsave(&p3_rsv_lock, flags);
 	e = p3_find_locked(pid);
@@ -165,7 +186,13 @@ SYSCALL_DEFINE1(cancel_rsv, pid_t, pid)
 	}
 
 	list_del(&e->node);
-	/* Demote task to SCHED_NORMAL (normal) */
+	WRITE_ONCE(e->canceled, true);
+	spin_unlock_irqrestore(&p3_rsv_lock, flags);
+
+	/* stop timer, wake any sleepers, drop scheduling to normal, free */
+	hrtimer_cancel(&e->timer);
+	wake_up_all(&e->wq);
+
 	if (e->task) {
 		struct sched_param sp = { .sched_priority = 0 };
 		sched_setscheduler_nocheck(e->task, SCHED_NORMAL, &sp);
@@ -173,9 +200,43 @@ SYSCALL_DEFINE1(cancel_rsv, pid_t, pid)
 	}
 	kfree(e);
 
-	/* Recompute RM priorities for remaining tasks */
+	/* recompute remaining priorities */
+	spin_lock_irqsave(&p3_rsv_lock, flags);
 	p3_reassign_rm_prios_locked();
-
 	spin_unlock_irqrestore(&p3_rsv_lock, flags);
+
 	return 0;
 }
+
+/* 4.4.2: wait until next period boundary for the caller's reservation */
+SYSCALL_DEFINE0(wait_until_next_period)
+{
+	struct p3_rsv_entry *e;
+	unsigned long flags;
+	u64 seen;
+
+	/* find entry for current */
+	spin_lock_irqsave(&p3_rsv_lock, flags);
+	e = p3_find_locked(current->pid);
+	if (!e) {
+		spin_unlock_irqrestore(&p3_rsv_lock, flags);
+		return -ENOENT;
+	}
+	/* take a snapshot of the current period sequence */
+	seen = atomic64_read(&e->period_seq);
+	spin_unlock_irqrestore(&p3_rsv_lock, flags);
+
+	/* if a new period already started, return immediately; else wait */
+	if (atomic64_read(&e->period_seq) != seen)
+		return 0;
+
+	if (wait_event_interruptible(e->wq,
+		atomic64_read(&e->period_seq) != seen || READ_ONCE(e->canceled)))
+		return -EINTR;
+
+	if (READ_ONCE(e->canceled))
+		return -ENOENT;
+	
+	return 0; 
+}
+
