@@ -12,39 +12,6 @@ This repository contains my complete work for **CS596: Theory of Real-Time Syste
 
 ---
 
-## Table of Contents
-- [Repo Layout](#repo-layout)
-- [Environment](#environment)
-- [Quick Start](#quick-start)
-- [Project 1 — Kernel Build & Versioning](#project-1--kernel-build--versioning)
-- [Project 2 — Syscalls & Kernel Modules](#project-2--syscalls--kernel-modules)
-- [Project 3 — Reservation Framework (RM) + Monitoring](#project-3--reservation-framework-rm--monitoring)
-- [Project 4 — Partitioned EDF + End-to-End Latency of Chains](#project-4--partitioned-edf--end-to-end-latency-of-chains)
-- [Debugging & Verification](#debugging--verification)
-- [Notes](#notes)
-- [References](#references)
-
----
-
-## Repo Layout
-
-Typical structure used across projects (may vary slightly by group/repo):
-```
-.
-├─ proj1/
-├─ proj2/
-│  ├─ kernel/
-│  ├─ modules/
-│  └─ apps/
-├─ proj3/
-│  ├─ kernel/
-│  ├─ modules/
-│  └─ apps/
-└─ proj4/
-   ├─ kernel/
-   └─ apps/
-```
-
 Each project follows the course build conventions:
 - **Built-in kernel code**: compiled into the kernel image
 - **Kernel modules**: built with kernel build system (Kbuild + Makefile)
@@ -91,8 +58,9 @@ dmesg -w
 ```
 
 ---
+## Works completed:
 
-## Project 1 — Kernel Build & Versioning
+## 1. Kernel Build & Versioning
 
 **Goal:** setup a reliable kernel build + boot pipeline and rename kernel version string.
 
@@ -107,7 +75,7 @@ dmesg -w
 
 ---
 
-## Project 2 — Syscalls & Kernel Modules
+## 2. Syscalls & Kernel Modules
 
 **Goal:** learn Linux kernel programming fundamentals:
 - user-space app
@@ -137,7 +105,7 @@ When loaded, forces calculator behavior to **modulo** regardless of requested op
 
 ---
 
-## Project 3 — Reservation Framework (RM) + Monitoring
+## 3. Reservation Framework (RM) + Monitoring
 
 **Goal:** implement a kernel-level **resource reservation framework** using the periodic task model `(C, T)` and enforce budget with monitoring.
 
@@ -172,7 +140,7 @@ Includes validation, error handling, and cleanup.
 
 ---
 
-## Project 4 — Partitioned EDF + End-to-End Latency of Chains
+## 4. Partitioned EDF + End-to-End Latency of Chains
 
 **Goal:** move from single-core RM concepts to **multi-core partitioned EDF**, plus **kernel-level end-to-end (E2E) latency measurement** for task chains.
 
@@ -240,7 +208,7 @@ Recommended tools/commands used across projects:
   - #398: `cancel_rsv`
   - #399: `wait_until_next_period`
   - #400: `get_e2e_latency`  
-(Each project uses its own kernel build/branch context as specified by the course.)
+- Not enough files were uploaded for now
 
 ---
 
