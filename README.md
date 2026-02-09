@@ -1,5 +1,5 @@
-# CS596 — Theory of Real-Time Systems (SDSU)  
-## Real-Time Embedded Linux Scheduling Framework on Raspberry Pi
+## Real-Time Embedded Linux Scheduling Framework on Raspberry Pi Project
+## Course: Theory of Real-Time Systems, Professor: Hyunjong Choi
 
 ![Platform](https://img.shields.io/badge/platform-Raspberry%20Pi%203%20(Model%20B)-informational)
 ![Domain](https://img.shields.io/badge/domain-Real--Time%20Systems-blue)
