@@ -1,4 +1,4 @@
-// proj3/kernel/p3_rsv.c — 4.2 + 4.4 minimal implementation
+// proj3/kernel/p3_rsv.c — Project 3: 4.2 + 4.4 with exit-cleanup
 #include <linux/kernel.h>
 #include <linux/syscalls.h>
 #include <linux/sched.h>
@@ -13,6 +13,8 @@
 #include <linux/hrtimer.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
+#include <linux/init.h>
+#include <trace/events/sched.h>   // register_trace_sched_process_exit()
 
 #define P3_MAX_RSV 50
 
@@ -39,7 +41,7 @@ struct p3_rsv_entry {
 static LIST_HEAD(p3_rsv_list);
 static DEFINE_SPINLOCK(p3_rsv_lock);
 
-/* ----- helpers ----- */
+/* ---------- helpers ---------- */
 
 static struct p3_rsv_entry *p3_find_locked(pid_t pid)
 {
@@ -85,14 +87,32 @@ static enum hrtimer_restart p3_timer_cb(struct hrtimer *t)
 		return HRTIMER_NORESTART;
 
 	atomic64_inc(&e->period_seq);
-
-	/* advance by one period and re-arm; forward_now avoids drift */
 	hrtimer_forward_now(&e->timer, e->T_ns);
 	wake_up_all(&e->wq);
 	return HRTIMER_RESTART;
 }
 
-/* ----- syscalls ----- */
+/* Free one reservation entry (common path for cancel + exit) */
+static void p3_free_entry(struct p3_rsv_entry *e)
+{
+	if (!e) return;
+
+	WRITE_ONCE(e->canceled, true);
+	hrtimer_cancel(&e->timer);
+	wake_up_all(&e->wq);
+
+	if (e->task) {
+		/* Move task back to normal if it's still alive */
+		if (!(e->task->flags & PF_EXITING)) {
+			struct sched_param sp = { .sched_priority = 0 };
+			sched_setscheduler_nocheck(e->task, SCHED_NORMAL, &sp);
+		}
+		put_task_struct(e->task);
+	}
+	kfree(e);
+}
+
+/* ---------- syscalls ---------- */
 
 SYSCALL_DEFINE3(set_rsv, pid_t, pid,
 		struct timespec __user *, C,
@@ -127,7 +147,6 @@ SYSCALL_DEFINE3(set_rsv, pid_t, pid,
 	rcu_read_unlock();
 	if (!p) return -ESRCH;
 
-	e = NULL;
 	spin_lock_irqsave(&p3_rsv_lock, flags);
 
 	if (p3_find_locked(pid)) {
@@ -161,7 +180,6 @@ SYSCALL_DEFINE3(set_rsv, pid_t, pid,
 	init_waitqueue_head(&e->wq);
 	hrtimer_init(&e->timer, CLOCK_MONOTONIC, HRTIMER_MODE_PINNED);
 	e->timer.function = p3_timer_cb;
-	/* first release is one period from now */
 	hrtimer_start(&e->timer, e->T_ns, HRTIMER_MODE_REL_PINNED);
 
 	list_add_tail(&e->node, &p3_rsv_list);
@@ -184,21 +202,10 @@ SYSCALL_DEFINE1(cancel_rsv, pid_t, pid)
 		spin_unlock_irqrestore(&p3_rsv_lock, flags);
 		return -ENOENT;
 	}
-
 	list_del(&e->node);
-	WRITE_ONCE(e->canceled, true);
 	spin_unlock_irqrestore(&p3_rsv_lock, flags);
 
-	/* stop timer, wake any sleepers, drop scheduling to normal, free */
-	hrtimer_cancel(&e->timer);
-	wake_up_all(&e->wq);
-
-	if (e->task) {
-		struct sched_param sp = { .sched_priority = 0 };
-		sched_setscheduler_nocheck(e->task, SCHED_NORMAL, &sp);
-		put_task_struct(e->task);
-	}
-	kfree(e);
+	p3_free_entry(e);
 
 	/* recompute remaining priorities */
 	spin_lock_irqsave(&p3_rsv_lock, flags);
@@ -208,25 +215,22 @@ SYSCALL_DEFINE1(cancel_rsv, pid_t, pid)
 	return 0;
 }
 
-/* 4.4.2: wait until next period boundary for the caller's reservation */
+/* 4.4.1: wait until next period boundary for the caller's reservation */
 SYSCALL_DEFINE0(wait_until_next_period)
 {
 	struct p3_rsv_entry *e;
 	unsigned long flags;
 	u64 seen;
 
-	/* find entry for current */
 	spin_lock_irqsave(&p3_rsv_lock, flags);
 	e = p3_find_locked(current->pid);
 	if (!e) {
 		spin_unlock_irqrestore(&p3_rsv_lock, flags);
 		return -ENOENT;
 	}
-	/* take a snapshot of the current period sequence */
 	seen = atomic64_read(&e->period_seq);
 	spin_unlock_irqrestore(&p3_rsv_lock, flags);
 
-	/* if a new period already started, return immediately; else wait */
 	if (atomic64_read(&e->period_seq) != seen)
 		return 0;
 
@@ -236,7 +240,39 @@ SYSCALL_DEFINE0(wait_until_next_period)
 
 	if (READ_ONCE(e->canceled))
 		return -ENOENT;
-	
-	return 0; 
+
+	return 0;
 }
 
+/* ---------- cleanup on task exit (4.4.2) ---------- */
+/* Triggered when any task exits; if it has a reservation, free it. */
+static void p3_sched_exit_cb(void *ignore, struct task_struct *p)
+{
+	struct p3_rsv_entry *e;
+	unsigned long flags;
+
+	if (!p)
+		return;
+
+	spin_lock_irqsave(&p3_rsv_lock, flags);
+	e = p3_find_locked(p->pid);
+	if (e)
+		list_del(&e->node);
+	spin_unlock_irqrestore(&p3_rsv_lock, flags);
+
+	if (e)
+		p3_free_entry(e);
+
+	/* reprioritize survivors */
+	spin_lock_irqsave(&p3_rsv_lock, flags);
+	p3_reassign_rm_prios_locked();
+	spin_unlock_irqrestore(&p3_rsv_lock, flags);
+}
+
+/* Register our exit callback at late init */
+static int __init p3_init(void)
+{
+	register_trace_sched_process_exit(p3_sched_exit_cb, NULL);
+	return 0;
+}
+late_initcall(p3_init);
